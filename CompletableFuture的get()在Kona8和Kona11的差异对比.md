@@ -731,7 +731,8 @@ public static void main(String[] args) throws Exception {
 ![](images/CompletableFuture的get()在Kona8和Kona11的差异对比-4.png)
 
 ## 我的改进建议
-直接删掉`Spins`是不妥当的，更好的改进方案应该是让原有的`PlatformThread`保留原有的`Spins`相关的自旋等待逻辑，而让`VirtualThread`执行删掉`Spins`的代码
+直接删掉`Spins`是不妥当的，更好的改进方案应该是让原有的`PlatformThread`保留`Spins`相关的自旋等待逻辑，而让`VirtualThread`执行删掉`Spins`后的代码。
+修改样例如下
 ```java
 private Object waitingGet(boolean interruptible) {
 
