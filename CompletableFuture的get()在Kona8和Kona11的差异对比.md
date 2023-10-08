@@ -669,9 +669,12 @@ public static void managedBlock(ManagedBlocker blocker)
 具体原因为：`VirtualThread`的切换开销对比`PlatformThread`会小很多，而自旋锁假设的是线程开销比较大，如果阻塞的时间不长，可以通过在CPU忙等的方式来等待结果，以此避免高额的线程开销。
 这就会有一个矛盾点：`VirthalThread`的开销没有那么大，自旋等待造成的开销可能比`VirtualThread`切换的开销更大。这样自旋等待就会造成额外的开销，所以可能应该删掉这段自旋等待的逻辑。
 
-#### 加大自旋spins对VirtualThread的影响
+
+#### 加大自旋Spins对VirtualThread的影响
 想证明`spins`可能会造成额外开销，就要尽可能让火焰图上和`spins`相关的部分长度变长。
 	我这里采取的方案为增大并发数，即提高`requestCount`的数量级，这样会加大`VirtualThread`间竞争资源的开销，增大其等待获取某种结果的次数，以此来加大`Spins`的影响。
+
+Notes：想要加大Spins的影响除了加大并发数以外，还可以尽可能减少SQL的查询时间，但考虑到本测试的sql已经很简单了，表里只有一张数据，所以从这个角度没有办法进行改进。但同时我也测试了如果增加查询sql的时间会怎样，相关分析可以再附录中看到。
 ```java
 public static void main(String[] args) throws Exception {
         threadCount = 1000;
@@ -690,7 +693,7 @@ public static void main(String[] args) throws Exception {
         ConnectionPool.closeConnection();
     }
 ```
-从下面两张火焰图上可以看到当requestCount增大后，waitingGet()开销显著增高，从约5.84%增高到了12.8%，并且和spins相关的`ThreadLocalRandom.nextSecondarySeed()`代码占比显著降低，在火焰图上几乎看不到了，只有0.05%左右。
+从下面两张火焰图上可以看到当`requestCount`增大后，`waitingGet()`开销显著增高，从约`5.84%`增高到了`12.8%`，并且和`spins`相关的`ThreadLocalRandom.nextSecondarySeed()`代码占比显著降低，在火焰图上几乎看不到了，只有`0.05%`左右。
 
 ![](images/CompletableFuture的get()在Kona8和Kona11的差异对比-1.png)
 ![](images/CompletableFuture的get()在Kona8和Kona11的差异对比.png)
@@ -1010,4 +1013,38 @@ sudo update-alternatives --config java # 切换java版本
 `configure: error: Could not find alsa!`
 解决：
 `sudo apt-get install libasound2-dev`
+
+### 增加查询sql和数据库的时间
+本次测试是基于`requestCount = 100000;`
+#### 修改数据库和查询语句
+新建立一张`hello_bigdata`表，表结构和`hello`相同，但是记录数为`1000`条。
+修改`sql`为`“select * from hello_bigdata where id = 500;”`
+```java
+public static void testSyncQuery() throws Exception {
+				...
+
+        Runnable r = new Runnable() {
+            @Override
+            public void run() {
+                try {
+                    startSignal.await();
+                    //String sql = "select * from hello";
+                    String sql = "select * from hello_bigdata where id = 500;"; // 修改sql
+		                ...
+                } catch (Exception e) {
+
+                }
+            }
+        };
+...
+    }
+```
+
+#### 火焰图分析
+修改数据库后发现`waitingGet()`的开销占比为`0.15%`，删除Spins后的开销占比为`0.03%`。如果用加减法的角度看开销减少了`0.12%`，以乘法的角度看开销较少了`4/5`。能感觉还是有性能提升的。
+![](images/CompletableFuture的get()在Kona8和Kona11的差异对比-5.png)
+
+
+
+![](images/CompletableFuture的get()在Kona8和Kona11的差异对比-6.png)
 
