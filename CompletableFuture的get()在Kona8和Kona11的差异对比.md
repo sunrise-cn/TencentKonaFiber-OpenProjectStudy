@@ -1,8 +1,11 @@
 
 ## 问题的发现
-### 简要介绍
-直接通过`Thread`或者实现`Runnable`接口的方式来创建线程都有一个显著的缺点：不能获取返回值。所以在`JDK1.5`中提供了`Callable#call()`方法来提供返回值，`Future#get()`方法来获取返回值，这样通过`Callabe`和`Future`相互配合的方式就解决了`Thread`和`Runnable`无法获取返回值的问题。但是这样只能解决一些简单场景，如果遇到比较复杂的业务场景，如希望多个线程的返回结果可以进行一定的编排，如结果转换：将上个任务的结果作为下个任务的输入重新计算产生新的结果这样的场景就力不从心了。所以J`DK8`又提供了`CompletableFuture`类来扩展和增强`Future`，同时支持任务的编排能力，如组织任务的运行顺序、规则和方式。如果想要进一步了解`CompletableFuture`，可以在附录查看。
-但是在KonaFiber中使用CompletableFuture的get()方法时，会发现KonaFiber8和KonaFiber11的开销并不相同，Kona8的开销往往会大一些。本次报告主要描述了我对这种开销差异的分析与思考。
+### 背景介绍
+直接通过`Thread`或者实现`Runnable`接口的方式来创建线程都有一个显著的缺点：不能获取返回值。所以在`JDK1.5`中提供了`Callable#call()`方法来提供返回值，`Future#get()`方法来获取返回值，这样通过`Callabe`和`Future`相互配合的方式就解决了`Thread`和`Runnable`无法获取返回值的问题。但是这样只能解决一些简单场景，如果遇到比较复杂的业务场景，如希望多个线程的返回结果可以进行一定的编排，如结果转换：将上个任务的结果作为下个任务的输入重新计算产生新的结果这样的场景就力不从心了。所以J`DK8`又提供了`CompletableFuture`类来扩展和增强`Future`，同时支持任务的编排能力，如组织任务的运行顺序、规则和方式。
+
+如果想要进一步了解`CompletableFuture`，可以在附录查看。
+### 问题的介绍
+在`KonaFiber`中使用`CompletableFuture`的`get()`方法时，会发现`KonaFiber8`和`KonaFiber11`的开销并不相同，`Kona8`的开销往往会大一些。本次报告主要描述了我对这种开销差异的分析与思考。
 
 ## 测试代码介绍
 本次测试代码来源于[TencentKona-8/demo/fiber/mysql_sync_stress_demo at KonaFiber · Tencent/TencentKona-8](https://github.com/Tencent/TencentKona-8/tree/KonaFiber/demo/fiber/mysql_sync_stress_demo)以下为我对该代码的理解和介绍
@@ -393,13 +396,13 @@ public static void testSyncQuery() throws Exception {
 #### KonaFiber 8与11中get()实现对比图
 如下图所示，KonaFiber8和11的主要差异在非蓝色部分：
 - 8采用了自旋等待的方式，通过不释放忙等来达到不释放cpu的目的。
-- 11利用了ForkJoinPool的work-steal算法，用**异步执行其它任务**来代替**无意义的忙等**，更加充分的利用了CPU资源。
+- 11利用了`ForkJoinPool`的`work-steal`算法，用**异步执行其它任务**来代替**无意义的忙等**，更加充分的利用了CPU资源。
 ![](images/kona8的waitingGet()调用过程.png)
 
 
 
 ####  Signaller
-Kona8和Kona11中的waitingGet()都使用到了`Signaller`内部类，所以先进行简要介绍：
+`Kona8`和`Kona11`中的`waitingGet()`都使用到了`Signaller`内部类，所以先进行简要介绍：
 `Signaller`内部类是一个信号，起到辅助唤醒和阻塞线程的作用。
 ```java
     /**
@@ -726,6 +729,58 @@ public static void main(String[] args) throws Exception {
 ![](images/CompletableFuture的get()在Kona8和Kona11的差异对比-3.png)
 同时我再对比KonaFiber11在同样情况下的开销为1.97%。
 ![](images/CompletableFuture的get()在Kona8和Kona11的差异对比-4.png)
+
+## 我的改进建议
+直接删掉`Spins`是不妥当的，更好的改进方案应该是让原有的`PlatformThread`保留原有的`Spins`相关的自旋等待逻辑，而让`VirtualThread`执行删掉`Spins`的代码
+```java
+private Object waitingGet(boolean interruptible) {
+
+        Signaller q = null;
+        boolean queued = false;
+        int spins = -1;
+        Object r;
+        boolean isVT = Thread.currentThread().isVirtual();  // 增加isVT判断当前是否是VirtualThread
+        while ((r = result) == null) {  
+                        if (!isVT) {  // 是platformThread就执行spins
+                            if (spins < 0)
+                                spins = SPINS;
+                            else if (spins > 0) {
+                                if (ThreadLocalRandom.nextSecondarySeed() >= 0)
+                                    --spins;
+                            }
+                        }
+            else if (q == null)
+                q = new Signaller(interruptible, 0L, 0L);
+            else if (!queued)
+                queued = tryPushStack(q);
+            else if (interruptible && q.interruptControl < 0) {
+                q.thread = null;
+                cleanStack();
+                return null;
+            }
+            else if (q.thread != null && result == null) {
+                try {
+                    ForkJoinPool.managedBlock(q);  // to block thread.
+                } catch (InterruptedException ie) {
+                    q.interruptControl = -1;
+                }
+            }
+        }
+        if (q != null) {
+            q.thread = null;
+            if (q.interruptControl < 0) {
+                if (interruptible)
+                    r = null; // report interruption
+                else
+                    Thread.currentThread().interrupt();
+            }
+        }
+        postComplete();
+                            //boolean falg = spins == 0;  // todo modiff add
+        return r;
+    }
+```
+
 ## 附录
 ### CompletableFuture
 #### 从new Thread()讲起
